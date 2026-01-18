@@ -2,6 +2,8 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
 use libc::{EINVAL, ENOENT};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -65,31 +67,58 @@ const ABOUT_ATTR: FileAttr = FileAttr {
     blksize: 512,
 };
 
-const SUBDIR_ATTR: FileAttr = FileAttr {
-    ino: 100,
-    size: 0,
-    blocks: 0,
-    atime: UNIX_EPOCH,
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::Directory,
-    perm: 0o555,
-    nlink: 2,
-    uid: 1000,
-    gid: 1000,
-    rdev: 0,
-    flags: 0,
-    blksize: 512,
-};
-
-pub struct XkcdFs {
-    pub latest_title: String,
-    pub latest_alt: String,
-    pub latest_img: Vec<u8>,
+#[derive(Deserialize, Default)]
+struct XkcdComic {
+    num: u64,
+    year: String,
+    month: String,
+    day: String,
+    title: String,
+    alt: String,
+    img: String,
+    safe_title: String,
+    transcript: String,
+    link: String,
 }
 
+#[derive(Default)]
+pub struct XkcdFs {
+    latest_num: u64,
+    http_client: reqwest::blocking::Client,
+    comics: HashMap<u64, XkcdComic>,
+}
+
+const COMIC_INODE_SHIFT: u64 = 1000;
+
 impl XkcdFs {
+    fn get_latest_num(&mut self) -> u64 {
+        if self.latest_num == 0 {
+            self.get_latest_comic();
+        }
+        return self.latest_num;
+    }
+
+    fn get_latest_comic(&mut self) {
+        let comic: XkcdComic = reqwest::blocking::get("https://xkcd.com/info.0.json")
+            .expect("Failed to fetch latest comic info")
+            .json::<XkcdComic>()
+            .expect("Failed to parse comic info");
+
+        self.latest_num = comic.num as u64;
+        self.comics.insert(self.latest_num, comic);
+    }
+
+    fn inode_to_comic(&self, inode: u64) -> Option<&XkcdComic> {
+        if inode > self.comics.len() as u64 {
+            return None;
+        }
+        if inode < COMIC_INODE_SHIFT {
+            return None;
+        }
+        let comic_num = inode / COMIC_INODE_SHIFT;
+        return self.comics.get(&comic_num);
+    }
+
     fn create_file_attr(&self, ino: u64, size: u64) -> FileAttr {
         FileAttr {
             ino,
@@ -110,15 +139,48 @@ impl XkcdFs {
         }
     }
 
-    fn get_file_attr(&self, ino: u64) -> Result<FileAttr, i32> {
+    fn get_file_attr(&mut self, ino: u64) -> Result<FileAttr, i32> {
         match ino {
             1 => Ok(DIR_ATTR),
             2 => Ok(XKCD_DESKTOP_ATTR),
             3 => Ok(ABOUT_ATTR),
-            4 => Ok(self.create_file_attr(4, self.latest_title.len() as u64)),
-            5 => Ok(self.create_file_attr(5, self.latest_alt.len() as u64)),
-            6 => Ok(self.create_file_attr(6, self.latest_img.len() as u64)),
-            100 => Ok(SUBDIR_ATTR),
+            100 => Ok(FileAttr {
+                ino: 100,
+                size: self.get_latest_num().to_string().len() as u64,
+                blocks: 0,
+                atime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                crtime: UNIX_EPOCH,
+                kind: FileType::Symlink,
+                perm: 0o444,
+                nlink: 1,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            }),
+            n if n % COMIC_INODE_SHIFT == 0 => Ok(FileAttr {
+                ino: n,
+                size: 0,
+                blocks: 0,
+                atime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                crtime: UNIX_EPOCH,
+                kind: FileType::Directory,
+                perm: 0o555,
+                nlink: 2,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            }),
+            n if n % COMIC_INODE_SHIFT == 4 => Ok(self.create_file_attr(n, 4096)),
+            n if n % COMIC_INODE_SHIFT == 5 => Ok(self.create_file_attr(n, 4096)),
+            n if n % COMIC_INODE_SHIFT == 6 => Ok(self.create_file_attr(n, 4096)),
             _ => Err(ENOENT),
         }
     }
@@ -127,9 +189,6 @@ impl XkcdFs {
         let data = match ino {
             2 => XKCD_DESKTOP_CONTENT.as_bytes(),
             3 => ABOUT_CONTENT.as_bytes(),
-            4 => self.latest_title.as_bytes(),
-            5 => self.latest_alt.as_bytes(),
-            6 => &self.latest_img,
             _ => return Err(ENOENT),
         };
 
@@ -149,19 +208,44 @@ impl XkcdFs {
 
 impl Filesystem for XkcdFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name = name.to_str();
-        let ino = match (parent, name) {
-            (1, Some("latest")) => 100,
-            (1, Some("xkcd.desktop")) => 2,
-            (1, Some("about.txt")) => 3,
-            (100, Some("title.txt")) => 4,
-            (100, Some("alt.txt")) => 5,
-            (100, Some("image.png")) => 6,
-            _ => {
-                reply.error(ENOENT);
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(EINVAL);
                 return;
             }
         };
+        let ino: u64;
+
+        let comic_num = name
+            .parse::<u64>()
+            .ok() // Turns Result into Option (discards the error)
+            .filter(|&n| (1..=self.get_latest_num()).contains(&n));
+
+        if let Some(num) = comic_num {
+            ino = num * COMIC_INODE_SHIFT;
+        } else if parent % COMIC_INODE_SHIFT == 0 {
+            ino = match name {
+                "title.txt" => 4,
+                "alt.txt" => 5,
+                "image.png" => 6,
+                _ => {
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+        } else {
+            ino = match (parent, name) {
+                (1, "latest") => 100,
+                (1, "xkcd.desktop") => 2,
+                (1, "about.txt") => 3,
+
+                _ => {
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+        }
 
         match self.get_file_attr(ino) {
             Ok(attr) => reply.entry(&TTL, &attr, 0),
@@ -193,6 +277,14 @@ impl Filesystem for XkcdFs {
         }
     }
 
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        if ino == 100 {
+            reply.data(self.get_latest_num().to_string().as_bytes());
+            return;
+        }
+        reply.error(ENOENT);
+    }
+
     fn readdir(
         &mut self,
         _req: &Request,
@@ -201,22 +293,26 @@ impl Filesystem for XkcdFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = if ino == 1 {
-            vec![
-                (1, FileType::Directory, "."),
-                (1, FileType::Directory, ".."),
-                (2, FileType::RegularFile, "xkcd.desktop"),
-                (3, FileType::RegularFile, "about.txt"),
-                (100, FileType::Directory, "latest"),
-            ]
-        } else if ino == 100 {
-            vec![
-                (100, FileType::Directory, "."),
-                (1, FileType::Directory, ".."),
-                (4, FileType::RegularFile, "title.txt"),
-                (5, FileType::RegularFile, "alt.txt"),
-                (6, FileType::RegularFile, "image.png"),
-            ]
+        let mut entries: Vec<(u64, FileType, String)>;
+        if ino == 1 {
+            entries = vec![
+                (1, FileType::Directory, ".".to_owned()),
+                (1, FileType::Directory, "..".to_owned()),
+                (2, FileType::RegularFile, "xkcd.desktop".to_owned()),
+                (3, FileType::RegularFile, "about.txt".to_owned()),
+                (100, FileType::Directory, "latest".to_owned()),
+            ];
+            for i in 1..self.get_latest_num() {
+                entries.push((i * COMIC_INODE_SHIFT, FileType::Directory, i.to_string()));
+            }
+        } else if ino % COMIC_INODE_SHIFT == 0 {
+            entries = vec![
+                (ino, FileType::Directory, ".".to_owned()),
+                (1, FileType::Directory, "..".to_owned()),
+                (ino + 4, FileType::RegularFile, "title.txt".to_owned()),
+                (ino + 5, FileType::RegularFile, "alt.txt".to_owned()),
+                (ino + 6, FileType::RegularFile, "image.png".to_owned()),
+            ];
         } else {
             reply.error(ENOENT);
             return;
@@ -239,46 +335,33 @@ mod tests {
 
     #[test]
     fn test_get_file_attr() {
-        let fs = XkcdFs {
-            latest_title: "Test Title".to_string(),
-            latest_alt: "Test Alt".to_string(),
-            latest_img: vec![1, 2, 3, 4],
+        let mut fs = XkcdFs {
+            latest_num: 0,
+            http_client: reqwest::blocking::Client::new(),
+            comics: vec![],
         };
 
         assert_eq!(fs.get_file_attr(1).unwrap().kind, FileType::Directory);
         assert_eq!(fs.get_file_attr(2).unwrap().kind, FileType::RegularFile);
-        assert_eq!(fs.get_file_attr(4).unwrap().size, 10); // "Test Title"
-        assert_eq!(fs.get_file_attr(6).unwrap().size, 4);
+        assert_eq!(fs.get_file_attr(3).unwrap().kind, FileType::RegularFile);
         assert_eq!(fs.get_file_attr(999).unwrap_err(), ENOENT);
     }
 
     #[test]
     fn test_read_data() {
         let fs = XkcdFs {
-            latest_title: "Title".to_string(),
-            latest_alt: "Alt".to_string(),
-            latest_img: vec![10, 20, 30],
+            latest_num: 0,
+            http_client: reqwest::blocking::Client::new(),
+            comics: vec![],
         };
 
-        // Test reading title (ino 4)
-        let data = fs.read_data(4, 0, 100).unwrap();
-        assert_eq!(data, b"Title");
+        // Test reading desktop file (ino 2)
+        let data = fs.read_data(2, 0, 100).unwrap();
+        assert_eq!(data, XKCD_DESKTOP_CONTENT.as_bytes());
 
-        // Test offset
-        let data = fs.read_data(4, 1, 100).unwrap();
-        assert_eq!(data, b"itle");
-
-        // Test size limit
-        let data = fs.read_data(4, 0, 2).unwrap();
-        assert_eq!(data, b"Ti");
-
-        // Test offset past end
-        let data = fs.read_data(4, 100, 10).unwrap();
-        assert_eq!(data, b"");
-
-        // Test negative offset
-        let err = fs.read_data(4, -1, 10).unwrap_err();
-        assert_eq!(err, EINVAL);
+        // Test reading about file (ino 3)
+        let data = fs.read_data(3, 0, 100).unwrap();
+        assert_eq!(data, ABOUT_CONTENT.as_bytes());
 
         // Test unknown inode
         let err = fs.read_data(999, 0, 10).unwrap_err();
